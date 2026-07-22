@@ -270,6 +270,9 @@ def get_all_reminders_with_next_date(user_id, today):
         r_copy["next_occurrence"] = next_occurrence.isoformat()
         result.append(r_copy)
     return result
+
+
+def compute_due_reminders(user_id, today):
     """
     Считает, какие напоминания актуальны СЕГОДНЯ — вызывается при каждом
     открытии приложения. Не требует отдельного планировщика/бэкенда:
