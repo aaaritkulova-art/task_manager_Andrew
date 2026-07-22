@@ -252,7 +252,24 @@ def delete_reminder(user_id, reminder_id):
     client.table("reminders").delete().eq("id", reminder_id).eq("user_id", user_id).execute()
 
 
-def compute_due_reminders(user_id, today):
+def get_all_reminders_with_next_date(user_id, today):
+    """Все активные напоминания с вычисленной ближайшей датой наступления —
+    используется, чтобы показывать напоминания в общем ежедневнике вместе
+    с задачами, а не только в баннере в день события."""
+    reminders = get_active_reminders(user_id)
+    result = []
+    for r in reminders:
+        event_date = date.fromisoformat(r["event_date"]) if isinstance(r["event_date"], str) else r["event_date"]
+        if r["recurrence"] == "yearly":
+            next_occurrence = date(today.year, event_date.month, event_date.day)
+            if next_occurrence < today or r.get("last_confirmed_year") == next_occurrence.year:
+                next_occurrence = date(today.year + 1, event_date.month, event_date.day)
+        else:
+            next_occurrence = event_date
+        r_copy = dict(r)
+        r_copy["next_occurrence"] = next_occurrence.isoformat()
+        result.append(r_copy)
+    return result
     """
     Считает, какие напоминания актуальны СЕГОДНЯ — вызывается при каждом
     открытии приложения. Не требует отдельного планировщика/бэкенда:

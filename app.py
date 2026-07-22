@@ -162,7 +162,7 @@ if due_reminders:
         when = {"заранее": f"через {abs(item['days_offset'])} дн.",
                 "сегодня": "сегодня",
                 "просрочено": f"было {abs(item['days_offset'])} дн. назад — не забудьте подтвердить"}[item["kind"]]
-        time_part = f" в {r['event_time']}" if r.get("event_time") else ""
+        time_part = f" в {str(r['event_time'])[:5]}" if r.get("event_time") else ""
         lines.append(f"🔔 **{r['title']}**{time_part} — {when}")
     st.warning("\n\n".join(lines))
 
@@ -349,11 +349,11 @@ def _mark_undone(task_id):
     db.update_task(user_id, task_id, status="новая")
 
 
-def render_planner(tasks_unfiltered, key_prefix, default_category=""):
-    """Рисует список задач, сгруппированный по датам, в формате ежедневника.
-    tasks_unfiltered — уже отобранный список задач (например, только одной
-    категории); key_prefix нужен, чтобы виджеты (галочки, кнопки) не
-    конфликтовали между разными видами (полный ежедневник / категория)."""
+def render_planner(tasks_unfiltered, key_prefix, default_category="", reminders=None):
+    """Рисует список задач (и, если переданы, напоминаний), сгруппированных
+    по датам, в формате ежедневника. reminders — список словарей с полем
+    next_occurrence (дата ближайшего наступления), показываются с 🔔 отдельно
+    от задач, без чекбокса выполнения (подтверждаются только через чат)."""
 
     show_completed = st.checkbox("Показывать выполненные задачи", value=False,
                                   key=f"{key_prefix}_show_completed")
@@ -362,17 +362,24 @@ def render_planner(tasks_unfiltered, key_prefix, default_category=""):
     if not show_completed:
         tasks = [t for t in tasks if t.get("status") != "готово"]
 
-    if tasks:
+    reminders = reminders or []
+
+    if tasks or reminders:
         by_date = {}
         no_date = []
         for t in tasks:
             if t.get("due_date"):
-                by_date.setdefault(t["due_date"], []).append(t)
+                by_date.setdefault(t["due_date"], {"tasks": [], "reminders": []})
+                by_date[t["due_date"]]["tasks"].append(t)
             else:
                 no_date.append(t)
 
-        for tasks_list in by_date.values():
-            tasks_list.sort(key=lambda t: t.get("due_time") or "99:99")
+        for r in reminders:
+            by_date.setdefault(r["next_occurrence"], {"tasks": [], "reminders": []})
+            by_date[r["next_occurrence"]]["reminders"].append(r)
+
+        for entry in by_date.values():
+            entry["tasks"].sort(key=lambda t: t.get("due_time") or "99:99")
 
         today_str = date.today().isoformat()
 
@@ -395,7 +402,11 @@ def render_planner(tasks_unfiltered, key_prefix, default_category=""):
                 label += "  — сегодня"
             st.markdown(f"#### {label}")
 
-            for t in by_date[due_date]:
+            for r in by_date[due_date]["reminders"]:
+                time_part = f" в {str(r['event_time'])[:5]}" if r.get("event_time") else ""
+                st.markdown(f"🔔 **{r['title']}**{time_part}")
+
+            for t in by_date[due_date]["tasks"]:
                 cols = st.columns([0.06, 0.16, 0.34, 0.15, 0.19, 0.1])
                 cols[0].checkbox("", value=(t["status"] == "готово"), key=f"{key_prefix}_d_{t['id']}",
                                   on_change=(lambda tid=t["id"], s=t["status"]:
@@ -488,8 +499,12 @@ def render_planner(tasks_unfiltered, key_prefix, default_category=""):
 # ---------------------------------------------------------------------------
 
 if st.session_state.view == "table":
-    st.caption("Отметки о выполнении и приоритет можно менять прямо здесь.")
-    render_planner(db.get_all_tasks(user_id), key_prefix="all")
+    st.caption("Отметки о выполнении и приоритет можно менять прямо здесь. 🔔 — напоминания (подтверждаются через чат).")
+    render_planner(
+        db.get_all_tasks(user_id),
+        key_prefix="all",
+        reminders=db.get_all_reminders_with_next_date(user_id, date.today())
+    )
 
 
 # ---------------------------------------------------------------------------
