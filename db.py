@@ -1,10 +1,14 @@
 """
 db.py — всё, что связано с облачной базой данных (Supabase).
 
-В отличие от версии на SQLite, здесь каждая функция принимает user_id первым
-аргументом — это и есть механизм "доступ с разных устройств": вы вводите
-один и тот же user_id на телефоне и на компьютере и попадаете в один и тот
-же набор данных.
+МОДЕЛЬ ДАННЫХ: одна таблица tasks для всех задач. Поле task_type различает
+три поведения:
+  'event'   — точная дата и время (приём, созвон, вылет)
+  'marker'  — точная дата, важно не забыть (день рождения, дедлайн)
+  'regular' — обычная задача, дата не обязательна
+
+Каждая функция принимает user_id первым аргументом — так на разных
+устройствах с одним и тем же ключом доступа видны одни и те же данные.
 """
 
 import os
@@ -13,6 +17,14 @@ from supabase import create_client, Client
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+PRIORITY_RANK = {"низкий": 0, "средний": 1, "высокий": 2}
+
+DEFAULT_PRIORITY_BY_TYPE = {
+    "event": "высокий",
+    "marker": "низкий",
+    "regular": "средний",
+}
 
 _client: Client = None
 
@@ -30,56 +42,99 @@ def get_client() -> Client:
     return _client
 
 
+def _merge_with_category_priority(user_id, category, priority):
+    """Если у категории задан приоритет по умолчанию (пользователь явно
+    попросил "категория X всегда высокий приоритет") — итоговый приоритет
+    задачи не может быть НИЖЕ приоритета категории. Если категория не задана
+    или у неё нет override — возвращает приоритет как есть."""
+    if not category:
+        return priority
+    client = get_client()
+    result = (
+        client.table("categories").select("default_priority")
+        .eq("user_id", user_id).eq("name", category).execute()
+    )
+    if not result.data:
+        return priority
+    cat_priority = result.data[0].get("default_priority")
+    if not cat_priority:
+        return priority
+    if PRIORITY_RANK.get(cat_priority, 0) > PRIORITY_RANK.get(priority, 0):
+        return cat_priority
+    return priority
+
+
 # ---------------------------------------------------------------------------
-# ЗАДАЧИ
+# ЗАДАЧИ (все три типа — event / marker / regular — в одной таблице)
 # ---------------------------------------------------------------------------
 
-def add_task(user_id, task, due_date=None, due_time=None, duration_minutes=60,
-             due_date_confidence="none", priority="средний", category="", source="ai"):
-    """Добавляет одну задачу. Возвращает созданную запись (словарь)."""
+def add_task(user_id, task, task_type="regular", due_date=None, due_time=None,
+             duration_minutes=60, due_date_confidence="none", priority=None,
+             category="", source="ai", recurrence=None, lead_days=None,
+             remind_on_day=True, repeat_on_day=None):
+    """
+    Добавляет одну задачу любого из трёх типов.
+
+    priority: если None — берётся значение по умолчанию для task_type
+              (event→высокий, marker→низкий, regular→средний), затем
+              приподнимается до приоритета категории, если он выше.
+    repeat_on_day: если None — True для marker с recurrence='yearly' (дни
+                   рождения нельзя пропускать), иначе False.
+    """
+    category = (category or "").strip()
+
+    if priority is None:
+        priority = DEFAULT_PRIORITY_BY_TYPE.get(task_type, "средний")
+    priority = _merge_with_category_priority(user_id, category, priority)
+
+    if repeat_on_day is None:
+        repeat_on_day = (task_type == "marker" and recurrence == "yearly")
+
     client = get_client()
     result = client.table("tasks").insert({
         "user_id": user_id,
         "task": task,
+        "task_type": task_type,
         "due_date": due_date,
         "due_time": due_time,
         "duration_minutes": duration_minutes or 60,
         "due_date_confidence": due_date_confidence,
+        "recurrence": recurrence,
+        "lead_days": lead_days if lead_days is not None else [1],
+        "remind_on_day": remind_on_day,
+        "repeat_on_day": repeat_on_day,
         "priority": priority,
         "category": category,
         "source": source,
     }).execute()
-    if category and category.strip():
-        ensure_category_exists(user_id, category.strip())
+
+    if category:
+        ensure_category_exists(user_id, category)
     return result.data[0] if result.data else None
 
 
 def get_tasks(user_id, date_from=None, date_to=None, status_not="готово"):
-    """Задачи пользователя за период [date_from, date_to]. Без дат — не фильтрует по дате."""
+    """Задачи пользователя за период [date_from, date_to]. Без дат — все."""
     client = get_client()
     query = client.table("tasks").select("*").eq("user_id", user_id)
-
     if date_from:
         query = query.gte("due_date", date_from)
     if date_to:
         query = query.lte("due_date", date_to)
     if status_not:
         query = query.neq("status", status_not)
-
     result = query.order("due_date", desc=False).order("priority", desc=True).execute()
     return result.data
 
 
-def get_open_tasks_summary(user_id, limit=30):
-    """
-    Короткий список незавершённых задач — используется как контекст для
-    модели, чтобы она могла понимать ссылки вида "перенеси её", "отметь
-    как готово" в чате.
-    """
+def get_open_tasks_summary(user_id, limit=40):
+    """Короткий список незавершённых задач всех типов — контекст для модели,
+    чтобы она понимала ссылки вида 'отметь звонок как сделанный' и видела
+    уже существующие маркеры/события, не создавая дубликаты."""
     client = get_client()
     result = (
         client.table("tasks")
-        .select("id, task, due_date, priority, status")
+        .select("id, task, task_type, due_date, due_time, priority, category, status, recurrence")
         .eq("user_id", user_id)
         .neq("status", "готово")
         .order("created_at", desc=True)
@@ -90,20 +145,27 @@ def get_open_tasks_summary(user_id, limit=30):
 
 
 def get_all_tasks(user_id):
-    """Все задачи пользователя (включая выполненные) — для табличного вида."""
+    """Все задачи пользователя (включая выполненные) — для полного ежедневника."""
     client = get_client()
     result = (
-        client.table("tasks")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("id", desc=True)
-        .execute()
+        client.table("tasks").select("*")
+        .eq("user_id", user_id).order("id", desc=True).execute()
+    )
+    return result.data
+
+
+def get_tasks_by_category(user_id, category):
+    """Все задачи (любого типа) конкретной категории — для отфильтрованного вида."""
+    client = get_client()
+    result = (
+        client.table("tasks").select("*")
+        .eq("user_id", user_id).eq("category", category).execute()
     )
     return result.data
 
 
 def update_task(user_id, task_id, **fields):
-    """Обновляет поля задачи по id (только для этого пользователя)."""
+    """Обновляет произвольные поля задачи по id."""
     if not fields:
         return
     client = get_client()
@@ -115,16 +177,42 @@ def delete_task(user_id, task_id):
     client.table("tasks").delete().eq("id", task_id).eq("user_id", user_id).execute()
 
 
+def complete_task(user_id, task_id, today_year):
+    """
+    Отмечает задачу выполненной/подтверждённой — с учётом типа:
+    - marker с recurrence='yearly' (день рождения и т.п.): НЕ переводится
+      в статус "готово" насовсем, а запоминается, что в ЭТОМ году уже
+      подтверждено (last_confirmed_year) — на следующий год напомнит снова.
+    - всё остальное (event, regular, marker с recurrence='once'):
+      обычный статус "готово".
+    """
+    client = get_client()
+    row = (
+        client.table("tasks").select("task_type, recurrence")
+        .eq("id", task_id).eq("user_id", user_id).execute()
+    )
+    if not row.data:
+        return
+    task_type, recurrence = row.data[0]["task_type"], row.data[0]["recurrence"]
+    if task_type == "marker" and recurrence == "yearly":
+        client.table("tasks").update(
+            {"last_confirmed_year": today_year}
+        ).eq("id", task_id).eq("user_id", user_id).execute()
+    else:
+        client.table("tasks").update(
+            {"status": "готово"}
+        ).eq("id", task_id).eq("user_id", user_id).execute()
+
+
 def upsert_tasks_from_table(user_id, rows):
-    """
-    Применяет изменения из редактируемой таблицы интерфейса.
-    Строки с id — обновляются, строки без id — считаются новыми и добавляются.
-    """
+    """Применяет изменения из редактируемой таблицы интерфейса. Строки с id
+    обновляются, строки без id считаются новыми и добавляются."""
     client = get_client()
     for row in rows:
         row_id = row.get("id")
         payload = {
             "task": row.get("task"),
+            "task_type": row.get("task_type") or "regular",
             "due_date": row.get("due_date") or None,
             "due_time": row.get("due_time") or None,
             "duration_minutes": row.get("duration_minutes") or 60,
@@ -143,206 +231,121 @@ def upsert_tasks_from_table(user_id, rows):
 
 def _is_nan(value):
     try:
-        return value != value  # True только для NaN
+        return value != value
     except Exception:
         return False
 
 
-# ---------------------------------------------------------------------------
-# ИСТОРИЯ ЧАТА (память)
-# ---------------------------------------------------------------------------
-
-def save_message(user_id, role, content):
-    """Сохраняет одно сообщение (пользователя или ассистента) в историю."""
-    client = get_client()
-    client.table("messages").insert({
-        "user_id": user_id,
-        "role": role,
-        "content": content,
-    }).execute()
-
-
-def get_recent_messages(user_id, limit=20):
+def get_tasks_for_planner(user_id, today, category=None):
     """
-    Последние N сообщений пользователя в хронологическом порядке —
-    именно это и даёт ассистенту "память" между сессиями и устройствами.
+    Возвращает задачи (опционально отфильтрованные по категории) с полем
+    display_date — датой, под которой задача должна показаться в
+    ежедневнике. Обычно совпадает с due_date, но:
+    - для marker с recurrence='yearly' пересчитывается на ближайшее
+      наступление даты в этом или следующем году (и пропускается, если
+      уже подтверждено в этом году);
+    - для regular задач с прошедшим сроком и status != 'готово' —
+      "переезжает" на сегодня (не потерялась, раз не выполнена вовремя).
+    event-задачи никогда не переезжают — пропущенная встреча остаётся
+    в прошлом, это не "долг", который нужно перенести.
     """
-    client = get_client()
-    result = (
-        client.table("messages")
-        .select("role, content, created_at")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    messages = result.data or []
-    return list(reversed(messages))  # разворачиваем в хронологический порядок
-
-
-# ---------------------------------------------------------------------------
-# НАПОМИНАНИЯ (дни рождения, встречи с фиксированной датой и т.п.)
-# ---------------------------------------------------------------------------
-
-def add_reminder(user_id, title, event_date, event_time=None, recurrence="once",
-                  lead_days=None, remind_on_day=True, repeat_on_day=False):
-    """
-    Добавляет одно напоминание.
-    recurrence: 'once' (разовое) | 'yearly' (повторяется каждый год, для ДР)
-    lead_days: список чисел — за сколько дней предупреждать заранее, напр. [7, 1]
-    repeat_on_day: если True — "нагонять" напоминание каждый день ПОСЛЕ дня
-                   события, пока пользователь явно не подтвердит (для ДР по
-                   умолчанию должно быть True — чтобы точно не забыть).
-    """
-    client = get_client()
-    result = client.table("reminders").insert({
-        "user_id": user_id,
-        "title": title,
-        "event_date": event_date,
-        "event_time": event_time,
-        "recurrence": recurrence,
-        "lead_days": lead_days if lead_days is not None else [1],
-        "remind_on_day": remind_on_day,
-        "repeat_on_day": repeat_on_day,
-    }).execute()
-    return result.data[0] if result.data else None
-
-
-def get_active_reminders(user_id):
-    """Все активные напоминания пользователя — используется и для расчёта
-    'что показать сегодня', и как контекст модели для команд вида
-    'поздравила Машу' / 'отмени напоминание про стоматолога'."""
-    client = get_client()
-    result = (
-        client.table("reminders")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("status", "active")
-        .execute()
-    )
-    return result.data
-
-
-def confirm_reminder(user_id, reminder_id, today_year):
-    """
-    Подтверждает напоминание ('поздравила', 'сделано').
-    Для разовых — переводит в status='done' насовсем.
-    Для ежегодных — запоминает, что в ЭТОМ году уже подтверждено
-    (на следующий год напоминание само 'проснётся' заново).
-    """
-    client = get_client()
-    reminder = (
-        client.table("reminders").select("recurrence")
-        .eq("id", reminder_id).eq("user_id", user_id).execute()
-    )
-    if not reminder.data:
-        return
-    if reminder.data[0]["recurrence"] == "yearly":
-        client.table("reminders").update(
-            {"last_confirmed_year": today_year}
-        ).eq("id", reminder_id).eq("user_id", user_id).execute()
-    else:
-        client.table("reminders").update(
-            {"status": "done"}
-        ).eq("id", reminder_id).eq("user_id", user_id).execute()
-
-
-def delete_reminder(user_id, reminder_id):
-    client = get_client()
-    client.table("reminders").delete().eq("id", reminder_id).eq("user_id", user_id).execute()
-
-
-def get_all_reminders_with_next_date(user_id, today):
-    """Все активные напоминания с вычисленной ближайшей датой наступления —
-    используется, чтобы показывать напоминания в общем ежедневнике вместе
-    с задачами, а не только в баннере в день события."""
-    reminders = get_active_reminders(user_id)
+    all_tasks = get_tasks_by_category(user_id, category) if category else get_all_tasks(user_id)
     result = []
-    for r in reminders:
-        event_date = date.fromisoformat(r["event_date"]) if isinstance(r["event_date"], str) else r["event_date"]
-        if r["recurrence"] == "yearly":
+
+    for t in all_tasks:
+        t = dict(t)
+        due_date_str = t.get("due_date")
+
+        if t["task_type"] == "marker" and t.get("recurrence") == "yearly" and due_date_str:
+            event_date = date.fromisoformat(due_date_str)
             next_occurrence = date(today.year, event_date.month, event_date.day)
-            if next_occurrence < today or r.get("last_confirmed_year") == next_occurrence.year:
+            already_confirmed = t.get("last_confirmed_year") == next_occurrence.year
+            if next_occurrence < today or already_confirmed:
                 next_occurrence = date(today.year + 1, event_date.month, event_date.day)
+                if t.get("last_confirmed_year") == next_occurrence.year:
+                    continue  # уже подтверждено и на следующий цикл — не показываем
+            t["display_date"] = next_occurrence.isoformat()
+
+        elif (t["task_type"] == "regular" and due_date_str and t["status"] != "готово"
+              and date.fromisoformat(due_date_str) < today):
+            t["display_date"] = today.isoformat()
+            t["original_date"] = due_date_str  # чтобы можно было показать "(с 18 июля)"
+
         else:
-            next_occurrence = event_date
-        r_copy = dict(r)
-        r_copy["next_occurrence"] = next_occurrence.isoformat()
-        result.append(r_copy)
+            t["display_date"] = due_date_str
+
+        result.append(t)
+
     return result
 
 
-def compute_due_reminders(user_id, today):
+def compute_due_markers(user_id, today):
     """
-    Считает, какие напоминания актуальны СЕГОДНЯ — вызывается при каждом
-    открытии приложения. Не требует отдельного планировщика/бэкенда:
-    вся логика — простое сравнение дат в Python.
-
-    Возвращает список словарей: {reminder, kind, days_offset}
+    Считает, какие marker-задачи актуальны СЕГОДНЯ — для баннера при
+    открытии приложения. Возвращает список {task, kind, days_offset}.
     kind: 'заранее' | 'сегодня' | 'просрочено'
     """
-    OVERDUE_WINDOW_DAYS = 30  # дольше месяца просроченный ДР не "нагоняем" —
-                               # считаем, что дата пропущена, и просто ждём
-                               # следующего цикла, чтобы не спамить вечно
+    OVERDUE_WINDOW_DAYS = 30
 
-    reminders = get_active_reminders(user_id)
+    client = get_client()
+    result = (
+        client.table("tasks").select("*")
+        .eq("user_id", user_id).eq("task_type", "marker")
+        .neq("status", "готово").execute()
+    )
+    markers = result.data
     due = []
 
-    for r in reminders:
-        event_date = date.fromisoformat(r["event_date"]) if isinstance(r["event_date"], str) else r["event_date"]
+    for m in markers:
+        if not m.get("due_date"):
+            continue
+        event_date = date.fromisoformat(m["due_date"])
 
-        if r["recurrence"] == "yearly":
-            already_confirmed_this_year = r.get("last_confirmed_year") == today.year
+        if m.get("recurrence") == "yearly":
+            already_confirmed_this_year = m.get("last_confirmed_year") == today.year
             this_year_occurrence = date(today.year, event_date.month, event_date.day)
             days_until = (this_year_occurrence - today).days
 
             if already_confirmed_this_year or days_until < -OVERDUE_WINDOW_DAYS:
-                # уже подтверждено в этом цикле, или дата была настолько давно,
-                # что смотрим вперёд, на следующий год
                 next_occurrence = date(today.year + 1, event_date.month, event_date.day)
                 days_until = (next_occurrence - today).days
-                lead_days = r.get("lead_days") or []
+                lead_days = m.get("lead_days") or []
                 if days_until in lead_days:
-                    due.append({"reminder": r, "kind": "заранее", "days_offset": days_until})
+                    due.append({"task": m, "kind": "заранее", "days_offset": days_until})
                 continue
         else:
             days_until = (event_date - today).days
 
-        lead_days = r.get("lead_days") or []
+        lead_days = m.get("lead_days") or []
 
-        if days_until < 0 and r.get("repeat_on_day", False):
-            # событие прошло, а подтверждения не было — "нагоняем" каждый день
-            due.append({"reminder": r, "kind": "просрочено", "days_offset": days_until})
-        elif days_until == 0 and r.get("remind_on_day", True):
-            due.append({"reminder": r, "kind": "сегодня", "days_offset": 0})
+        if days_until < 0 and m.get("repeat_on_day", False):
+            due.append({"task": m, "kind": "просрочено", "days_offset": days_until})
+        elif days_until == 0 and m.get("remind_on_day", True):
+            due.append({"task": m, "kind": "сегодня", "days_offset": 0})
         elif days_until in lead_days:
-            due.append({"reminder": r, "kind": "заранее", "days_offset": days_until})
+            due.append({"task": m, "kind": "заранее", "days_offset": days_until})
 
     return due
 
 
 # ---------------------------------------------------------------------------
-# КАТЕГОРИИ — существуют как отдельная сущность, чтобы кнопка в сайдбаре
-# могла появиться ДО того, как в этой категории будет хоть одна задача.
+# КАТЕГОРИИ
 # ---------------------------------------------------------------------------
 
 def ensure_category_exists(user_id, name):
-    """Регистрирует категорию, если её ещё нет. Дубликат имени — это штатная
-    ситуация (категория уже есть) и тихо игнорируется; любая другая ошибка
-    (например, RLS блокирует запись) — пробрасывается дальше, чтобы не
-    прятать реальную проблему молча."""
+    """Регистрирует категорию, если её ещё нет. Дубликат имени — штатная
+    ситуация и тихо игнорируется; любая другая ошибка пробрасывается дальше."""
     client = get_client()
     try:
         client.table("categories").insert({"user_id": user_id, "name": name}).execute()
     except Exception as e:
         if "duplicate" in str(e).lower() or "unique" in str(e).lower():
-            pass  # категория с таким именем уже существует — это нормально
+            pass
         else:
             raise
 
 
 def get_categories(user_id):
-    """Список названий категорий пользователя, отсортированный по алфавиту."""
     client = get_client()
     result = (
         client.table("categories").select("name")
@@ -356,15 +359,15 @@ def delete_category(user_id, name):
     client.table("categories").delete().eq("user_id", user_id).eq("name", name).execute()
 
 
-def get_tasks_by_category(user_id, category):
-    """Все незавершённые задачи конкретной категории — для отфильтрованного ежедневника."""
+def set_category_priority(user_id, name, priority):
+    """Задаёт приоритет по умолчанию для категории — новые задачи этой
+    категории будут получать приоритет не ниже указанного. Не меняет
+    приоритет уже существующих задач задним числом."""
+    ensure_category_exists(user_id, name)
     client = get_client()
-    result = (
-        client.table("tasks").select("*")
-        .eq("user_id", user_id).eq("category", category)
-        .execute()
-    )
-    return result.data
+    client.table("categories").update(
+        {"default_priority": priority}
+    ).eq("user_id", user_id).eq("name", name).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +381,6 @@ def add_list(user_id, name):
 
 
 def get_lists(user_id):
-    """Список словарей {id, name} — списки пользователя, по алфавиту."""
     client = get_client()
     result = (
         client.table("lists").select("id, name")
@@ -388,8 +390,6 @@ def get_lists(user_id):
 
 
 def get_lists_with_items(user_id):
-    """Списки вместе с текстами их пунктов — используется как контекст для
-    модели, чтобы она могла находить нужный список/пункт по смыслу."""
     lists = get_lists(user_id)
     result = []
     for l in lists:
@@ -402,13 +402,8 @@ def get_lists_with_items(user_id):
 
 
 def find_or_create_list(user_id, name):
-    """Находит список по имени (без учёта регистра) или создаёт новый,
-    если такого ещё нет. Возвращает id списка."""
     client = get_client()
-    existing = (
-        client.table("lists").select("id, name")
-        .eq("user_id", user_id).execute()
-    )
+    existing = client.table("lists").select("id, name").eq("user_id", user_id).execute()
     for l in existing.data:
         if l["name"].strip().lower() == name.strip().lower():
             return l["id"]
@@ -447,3 +442,28 @@ def update_list_item(user_id, item_id, checked):
 def delete_list_item(user_id, item_id):
     client = get_client()
     client.table("list_items").delete().eq("id", item_id).eq("user_id", user_id).execute()
+
+
+# ---------------------------------------------------------------------------
+# ИСТОРИЯ ЧАТА (память)
+# ---------------------------------------------------------------------------
+
+def save_message(user_id, role, content):
+    client = get_client()
+    client.table("messages").insert({
+        "user_id": user_id, "role": role, "content": content,
+    }).execute()
+
+
+def get_recent_messages(user_id, limit=20):
+    client = get_client()
+    result = (
+        client.table("messages")
+        .select("role, content, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    messages = result.data or []
+    return list(reversed(messages))
