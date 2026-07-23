@@ -206,8 +206,14 @@ if st.session_state.view == "chat":
                 category_priority_result = None
                 list_results = None
 
-                if intent == "add_task":
-                    for t in interpretation.get("tasks", []):
+                # Одно сообщение может содержать НЕСКОЛЬКО разных действий сразу
+                # (например "закончила задачу X, а ещё нужно Y и Z") — поэтому
+                # обрабатываем каждый непустой блок из ответа модели независимо,
+                # а не только тот, что указан в "intent" (он используется лишь
+                # для query, у которой нет своего массива).
+
+                if interpretation.get("tasks"):
+                    for t in interpretation["tasks"]:
                         db.add_task(
                             user_id=user_id,
                             task=t.get("task", "").strip(),
@@ -218,51 +224,42 @@ if st.session_state.view == "chat":
                             due_date_confidence=t.get("due_date_confidence", "none"),
                             recurrence=t.get("recurrence"),
                             lead_days=t.get("lead_days"),
-                            priority=t.get("priority"),  # None -> дефолт по типу применится в db.py
+                            priority=t.get("priority"),
                             category=t.get("category", ""),
                             source="ai"
                         )
 
-                elif intent == "query":
-                    tasks_from_db = db.get_tasks(
-                        user_id=user_id,
-                        date_from=interpretation.get("query_date_from"),
-                        date_to=interpretation.get("query_date_to")
-                    )
-
-                elif intent == "update_task":
+                if interpretation.get("updates"):
                     update_results = []
-                    for u in interpretation.get("updates", []):
+                    for u in interpretation["updates"]:
                         task_id = u.get("task_id")
                         changes = dict(u.get("changes", {}))
                         if not task_id or not changes:
                             continue
                         if changes.get("status") == "готово":
-                            # используем умный helper — для marker с recurrence='yearly'
-                            # это НЕ статус "готово" навсегда, а подтверждение цикла
                             db.complete_task(user_id, task_id, date.today().year)
                             changes.pop("status")
                         if changes:
                             db.update_task(user_id, task_id, **changes)
                         update_results.append({"task_id": task_id, "changes": u.get("changes", {})})
 
-                elif intent == "delete_task":
+                if interpretation.get("deletes"):
                     delete_results = []
-                    for d in interpretation.get("deletes", []):
+                    for d in interpretation["deletes"]:
                         task_id = d.get("task_id")
                         if task_id:
                             db.delete_task(user_id, task_id)
                             delete_results.append({"task_id": task_id})
 
-                elif intent == "set_category_priority":
-                    cp = interpretation.get("category_priority")
-                    if cp and cp.get("category") and cp.get("priority"):
+                if interpretation.get("category_priority"):
+                    cp = interpretation["category_priority"]
+                    if cp.get("category") and cp.get("priority"):
                         db.set_category_priority(user_id, cp["category"].strip(), cp["priority"])
                         category_priority_result = cp
 
-                elif intent == "list_action":
+                if interpretation.get("list_actions"):
                     list_results = []
-                    for la in interpretation.get("list_actions", []):
+                    for la in interpretation["list_actions"]:
                         action = la.get("action")
                         list_name = la.get("list_name", "").strip()
                         item_text = la.get("item", "").strip()
@@ -289,6 +286,13 @@ if st.session_state.view == "chat":
                                     db.delete_list_item(user_id, match["id"])
                                 list_results.append({"action": action, "list": list_name, "item": match["content"]})
 
+                if intent == "query":
+                    tasks_from_db = db.get_tasks(
+                        user_id=user_id,
+                        date_from=interpretation.get("query_date_from"),
+                        date_to=interpretation.get("query_date_to")
+                    )
+
                 reply_text = assistant.formulate_reply(
                     user_message=user_input,
                     interpretation=interpretation,
@@ -305,7 +309,9 @@ if st.session_state.view == "chat":
         st.session_state.chat_history.append({"role": "assistant", "content": reply_text})
         db.save_message(user_id, "assistant", reply_text)
 
-        if intent in ("add_task", "list_action", "delete_task", "set_category_priority"):
+        if (interpretation.get("tasks") or interpretation.get("list_actions")
+                or interpretation.get("deletes") or interpretation.get("category_priority")):
+            # новая категория/список могли появиться — обновляем сайдбар
             st.rerun()
 
 
