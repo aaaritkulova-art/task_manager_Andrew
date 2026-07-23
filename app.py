@@ -191,6 +191,7 @@ if st.session_state.view == "chat":
                 open_tasks = db.get_open_tasks_summary(user_id)
                 lists_with_items = db.get_lists_with_items(user_id)
                 existing_categories = db.get_categories(user_id)
+                existing_category_rules = db.get_category_rules(user_id)
                 history_for_context = st.session_state.chat_history[:-1][-20:]
 
                 interpretation = assistant.interpret_message(
@@ -198,7 +199,8 @@ if st.session_state.view == "chat":
                     chat_history=history_for_context,
                     open_tasks=open_tasks,
                     lists_with_items=lists_with_items,
-                    categories=existing_categories
+                    categories=existing_categories,
+                    category_rules=existing_category_rules
                 )
                 intent = interpretation.get("intent", "chat")
 
@@ -206,6 +208,8 @@ if st.session_state.view == "chat":
                 update_results = None
                 delete_results = None
                 category_priority_result = None
+                category_rule_results = None
+                create_category_results = None
                 list_results = None
 
                 # Одно сообщение может содержать НЕСКОЛЬКО разных действий сразу
@@ -254,10 +258,33 @@ if st.session_state.view == "chat":
                             delete_results.append({"task_id": task_id})
 
                 if interpretation.get("category_priority"):
-                    cp = interpretation["category_priority"]
-                    if cp.get("category") and cp.get("priority"):
-                        db.set_category_priority(user_id, cp["category"].strip(), cp["priority"])
-                        category_priority_result = cp
+                    cp_raw = interpretation["category_priority"]
+                    # модель иногда возвращает список вместо одного объекта,
+                    # если в сообщении было упомянуто несколько категорий —
+                    # обрабатываем оба случая без падения
+                    cp_list = cp_raw if isinstance(cp_raw, list) else [cp_raw]
+                    category_priority_result = []
+                    for cp in cp_list:
+                        if isinstance(cp, dict) and cp.get("category") and cp.get("priority"):
+                            db.set_category_priority(user_id, cp["category"].strip(), cp["priority"])
+                            category_priority_result.append(cp)
+
+                if interpretation.get("category_rules"):
+                    category_rule_results = []
+                    for rule in interpretation["category_rules"]:
+                        keyword = rule.get("keyword", "").strip()
+                        category = rule.get("category", "").strip()
+                        if keyword and category:
+                            db.add_category_rule(user_id, keyword, category)
+                            category_rule_results.append({"keyword": keyword, "category": category})
+
+                if interpretation.get("create_categories"):
+                    create_category_results = []
+                    for name in interpretation["create_categories"]:
+                        name = (name or "").strip()
+                        if name:
+                            db.ensure_category_exists(user_id, name)
+                            create_category_results.append(name)
 
                 if interpretation.get("list_actions"):
                     list_results = []
@@ -303,6 +330,8 @@ if st.session_state.view == "chat":
                     update_results=update_results,
                     delete_results=delete_results,
                     category_priority_result=category_priority_result,
+                    category_rule_results=category_rule_results,
+                    create_category_results=create_category_results,
                     list_results=list_results
                 )
 
@@ -312,7 +341,8 @@ if st.session_state.view == "chat":
         db.save_message(user_id, "assistant", reply_text)
 
         if (interpretation.get("tasks") or interpretation.get("list_actions")
-                or interpretation.get("deletes") or interpretation.get("category_priority")):
+                or interpretation.get("deletes") or interpretation.get("category_priority")
+                or interpretation.get("category_rules") or interpretation.get("create_categories")):
             # новая категория/список могли появиться — обновляем сайдбар
             st.rerun()
 

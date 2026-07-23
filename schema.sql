@@ -52,6 +52,13 @@ alter table tasks add column if not exists last_confirmed_year integer;
 -- по определению это тип "event". Безопасно выполнять повторно.
 update tasks set task_type = 'event' where due_time is not null and task_type = 'regular';
 
+-- Обычные задачи без даты больше не "висят в воздухе" отдельным блоком —
+-- сразу встают на сегодня и дальше "переезжают" день за днём, пока не
+-- будут выполнены. Разово подтягиваем уже существующие такие задачи
+-- (созданные до этого изменения). Безопасно выполнять повторно.
+update tasks set due_date = current_date
+where task_type = 'regular' and due_date is null and status != 'готово';
+
 create table if not exists messages (
     id bigint generated always as identity primary key,
     user_id text not null,
@@ -75,6 +82,17 @@ create table if not exists categories (
 );
 
 alter table categories add column if not exists default_priority text;
+
+create table if not exists category_rules (
+    id bigint generated always as identity primary key,
+    user_id text not null,
+    keyword text not null,   -- слово/тема, по которой определяется категория
+    category text not null,  -- в какую категорию попадает задача с этим словом
+    created_at timestamptz default now(),
+    unique(user_id, keyword)
+);
+
+alter table category_rules disable row level security;
 
 create table if not exists lists (
     id bigint generated always as identity primary key,

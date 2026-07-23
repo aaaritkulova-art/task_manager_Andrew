@@ -90,6 +90,12 @@ def add_task(user_id, task, task_type="regular", due_date=None, due_time=None,
     if repeat_on_day is None:
         repeat_on_day = (task_type == "marker" and recurrence == "yearly")
 
+    # Обычная задача без указанной даты — не "висит в воздухе", а сразу
+    # встаёт на сегодня; если не будет выполнена, дальше сработает обычная
+    # логика "переезда" на следующий день (get_tasks_for_planner).
+    if task_type == "regular" and not due_date:
+        due_date = date.today().isoformat()
+
     client = get_client()
     result = client.table("tasks").insert({
         "user_id": user_id,
@@ -210,10 +216,14 @@ def upsert_tasks_from_table(user_id, rows):
     client = get_client()
     for row in rows:
         row_id = row.get("id")
+        row_task_type = row.get("task_type") or "regular"
+        row_due_date = row.get("due_date") or None
+        if row_task_type == "regular" and not row_due_date:
+            row_due_date = date.today().isoformat()
         payload = {
             "task": row.get("task"),
-            "task_type": row.get("task_type") or "regular",
-            "due_date": row.get("due_date") or None,
+            "task_type": row_task_type,
+            "due_date": row_due_date,
             "due_time": row.get("due_time") or None,
             "duration_minutes": row.get("duration_minutes") or 60,
             "due_date_confidence": row.get("due_date_confidence") or "none",
@@ -368,6 +378,39 @@ def set_category_priority(user_id, name, priority):
     client.table("categories").update(
         {"default_priority": priority}
     ).eq("user_id", user_id).eq("name", name).execute()
+
+
+def add_category_rule(user_id, keyword, category):
+    """Задаёт правило: задачи, упоминающие keyword, автоматически относятся
+    к category — на будущее, не задним числом. Повторное объявление
+    правила для того же keyword обновляет категорию (last wins)."""
+    category = category.strip()
+    keyword = keyword.strip().lower()
+    ensure_category_exists(user_id, category)
+    client = get_client()
+    existing = (
+        client.table("category_rules").select("id")
+        .eq("user_id", user_id).eq("keyword", keyword).execute()
+    )
+    if existing.data:
+        client.table("category_rules").update(
+            {"category": category}
+        ).eq("id", existing.data[0]["id"]).execute()
+    else:
+        client.table("category_rules").insert({
+            "user_id": user_id, "keyword": keyword, "category": category
+        }).execute()
+
+
+def get_category_rules(user_id):
+    """Список словарей {keyword, category} — правила автораспределения
+    пользователя, используется как контекст для модели."""
+    client = get_client()
+    result = (
+        client.table("category_rules").select("keyword, category")
+        .eq("user_id", user_id).order("keyword").execute()
+    )
+    return result.data
 
 
 # ---------------------------------------------------------------------------
