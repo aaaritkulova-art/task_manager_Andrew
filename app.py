@@ -190,13 +190,15 @@ if st.session_state.view == "chat":
 
                 open_tasks = db.get_open_tasks_summary(user_id)
                 lists_with_items = db.get_lists_with_items(user_id)
+                existing_categories = db.get_categories(user_id)
                 history_for_context = st.session_state.chat_history[:-1][-20:]
 
                 interpretation = assistant.interpret_message(
                     user_message=user_input,
                     chat_history=history_for_context,
                     open_tasks=open_tasks,
-                    lists_with_items=lists_with_items
+                    lists_with_items=lists_with_items,
+                    categories=existing_categories
                 )
                 intent = interpretation.get("intent", "chat")
 

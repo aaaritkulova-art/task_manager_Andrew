@@ -81,7 +81,7 @@ def add_task(user_id, task, task_type="regular", due_date=None, due_time=None,
     repeat_on_day: если None — True для marker с recurrence='yearly' (дни
                    рождения нельзя пропускать), иначе False.
     """
-    category = (category or "").strip()
+    category = (category or "").strip() or "Общее"
 
     if priority is None:
         priority = DEFAULT_PRIORITY_BY_TYPE.get(task_type, "средний")
