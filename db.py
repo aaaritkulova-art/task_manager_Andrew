@@ -365,7 +365,16 @@ def get_categories(user_id):
 
 
 def delete_category(user_id, name):
+    """Удаляет категорию целиком. Задачи, которые были в ней, НЕ теряются —
+    переносятся в категорию «Общее» (иначе они остались бы с текстом
+    несуществующей категории и стали бы недостижимы через сайдбар). Заодно
+    удаляются связанные с этой категорией правила автораспределения."""
     client = get_client()
+    client.table("tasks").update(
+        {"category": "Общее"}
+    ).eq("user_id", user_id).eq("category", name).execute()
+    ensure_category_exists(user_id, "Общее")
+    client.table("category_rules").delete().eq("user_id", user_id).eq("category", name).execute()
     client.table("categories").delete().eq("user_id", user_id).eq("name", name).execute()
 
 

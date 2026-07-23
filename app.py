@@ -210,6 +210,8 @@ if st.session_state.view == "chat":
                 category_priority_result = None
                 category_rule_results = None
                 create_category_results = None
+                delete_category_results = None
+                delete_list_results = None
                 list_results = None
 
                 # Одно сообщение может содержать НЕСКОЛЬКО разных действий сразу
@@ -286,6 +288,28 @@ if st.session_state.view == "chat":
                             db.ensure_category_exists(user_id, name)
                             create_category_results.append(name)
 
+                if interpretation.get("delete_categories"):
+                    delete_category_results = []
+                    for name in interpretation["delete_categories"]:
+                        name = (name or "").strip()
+                        if name and name != "Общее":
+                            db.delete_category(user_id, name)
+                            delete_category_results.append(name)
+                            if st.session_state.get("active_category") == name:
+                                st.session_state.view = "chat"
+
+                if interpretation.get("delete_lists"):
+                    delete_list_results = []
+                    existing_lists = db.get_lists(user_id)
+                    for name in interpretation["delete_lists"]:
+                        name = (name or "").strip().lower()
+                        match = next((l for l in existing_lists if l["name"].strip().lower() == name), None)
+                        if match:
+                            db.delete_list(user_id, match["id"])
+                            delete_list_results.append(match["name"])
+                            if st.session_state.get("active_list_id") == match["id"]:
+                                st.session_state.view = "chat"
+
                 if interpretation.get("list_actions"):
                     list_results = []
                     for la in interpretation["list_actions"]:
@@ -332,6 +356,8 @@ if st.session_state.view == "chat":
                     category_priority_result=category_priority_result,
                     category_rule_results=category_rule_results,
                     create_category_results=create_category_results,
+                    delete_category_results=delete_category_results,
+                    delete_list_results=delete_list_results,
                     list_results=list_results
                 )
 
@@ -342,8 +368,9 @@ if st.session_state.view == "chat":
 
         if (interpretation.get("tasks") or interpretation.get("list_actions")
                 or interpretation.get("deletes") or interpretation.get("category_priority")
-                or interpretation.get("category_rules") or interpretation.get("create_categories")):
-            # новая категория/список могли появиться — обновляем сайдбар
+                or interpretation.get("category_rules") or interpretation.get("create_categories")
+                or interpretation.get("delete_categories") or interpretation.get("delete_lists")):
+            # новая/удалённая категория или список — обновляем сайдбар
             st.rerun()
 
 
@@ -544,7 +571,13 @@ if st.session_state.view == "table":
 
 elif st.session_state.view == "category":
     cat = st.session_state.get("active_category", "")
-    st.subheader(f"🏷️ {cat}")
+    col1, col2 = st.columns([0.8, 0.2])
+    col1.subheader(f"🏷️ {cat}")
+    if cat != "Общее":
+        if col2.button("🗑️ Удалить категорию", key="delete_category_btn"):
+            db.delete_category(user_id, cat)
+            st.session_state.view = "chat"
+            st.rerun()
     render_planner(key_prefix=f"cat_{cat}", category=cat)
 
 
